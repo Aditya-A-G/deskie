@@ -1,0 +1,206 @@
+#!/bin/bash
+# Deskie launcher, run by the SessionStart hook.
+#
+# Fast path (a few ms): exit if the app answers /health, or if
+# ~/.desk-buddy/settings.json has "startWithClaude": false.
+# Otherwise a detached background job installs the app if needed and starts it with
+# `open -g` (no focus steal), so Claude never waits on a download.
+#
+# Never prints, always exits 0. Progress goes to ~/.desk-buddy/launcher.log.
+#
+# Overrides (for development and tests):
+#   DESK_BUDDY_DEV_APP=/path/Deskie.app   launch this bundle as is, no install
+#   DESK_BUDDY_DEV_APP=/path/to/desk-buddy/app  run the source checkout with its local Electron
+#   DESK_BUDDY_DEV_APP=/path/to/Desk-Buddy.zip  install from this zip (no checksum check)
+#   DESK_BUDDY_RELEASE_URL=http://127.0.0.1:8000/{file}   release URL template ({version}, {file})
+#   DESK_BUDDY_APPS_DIR=/some/dir              install here instead of ~/Applications
+#   DESK_BUDDY_HOME=/some/dir                  instead of ~/.desk-buddy (passed on to the app)
+#   DESK_BUDDY_LAUNCHER_FOREGROUND=1           do the work in the foreground (tests)
+#   DESK_BUDDY_OPEN_CMD, DESK_BUDDY_HEALTH_WAIT  replace `open` and the 20 s health wait (tests)
+
+[ "${DESK_BUDDY_CLASSIFIER:-}" = "1" ] && exit 0
+
+exec 3>&1 >/dev/null 2>&1 </dev/null   # fd 3 = the hook's real stdout, used only for the setup message
+umask 022
+
+PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+HOME_DIR="${DESK_BUDDY_HOME:-$HOME/.desk-buddy}"
+APPS_DIR="${DESK_BUDDY_APPS_DIR:-$HOME/Applications}"
+APP_NAME="Deskie.app"
+APP="$APPS_DIR/$APP_NAME"
+
+ENV_RELEASE_URL="${DESK_BUDDY_RELEASE_URL:-}"
+# shellcheck source=config.sh disable=SC1091
+. "$PLUGIN_DIR/config.sh"
+[ -n "$ENV_RELEASE_URL" ] && DESK_BUDDY_RELEASE_URL="$ENV_RELEASE_URL"
+PINNED="$DESK_BUDDY_APP_VERSION"
+
+if [ -f "$HOME_DIR/settings.json" ] && grep -Eq '"startWithClaude"[[:space:]]*:[[:space:]]*false' "$HOME_DIR/settings.json"; then
+  exit 0
+fi
+
+healthy() {
+  local port=""
+  [ -r "$HOME_DIR/port" ] && read -r port < "$HOME_DIR/port"
+  case "$port" in ''|*[!0-9]*) return 1 ;; esac
+  curl -s -m 1 "http://127.0.0.1:$port/health" 2>/dev/null | grep -q '"ok":true'
+}
+
+healthy && exit 0
+
+log() {
+  mkdir -p "$HOME_DIR"
+  local f="$HOME_DIR/launcher.log"
+  if [ -f "$f" ] && [ "$(wc -c < "$f")" -gt 200000 ]; then mv -f "$f" "$f.1"; fi
+  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >> "$f"
+}
+
+# 0 if $1 < $2 (numeric x.y.z, pre-release suffix ignored)
+version_lt() {
+  local a="${1%%[-+]*}" b="${2%%[-+]*}" i x y
+  local -a av bv
+  IFS=. read -r -a av <<< "$a"
+  IFS=. read -r -a bv <<< "$b"
+  for i in 0 1 2; do
+    x="${av[$i]:-0}"; y="${bv[$i]:-0}"
+    case "$x" in ''|*[!0-9]*) x=0 ;; esac
+    case "$y" in ''|*[!0-9]*) y=0 ;; esac
+    [ "$x" -lt "$y" ] && return 0
+    [ "$x" -gt "$y" ] && return 1
+  done
+  return 1
+}
+
+installed_version() { # prints nothing when there is no app (PlistBuddy reports errors on stdout)
+  [ -f "$1/Contents/Info.plist" ] || return 0
+  local v
+  v="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$1/Contents/Info.plist" 2>/dev/null)" || return 0
+  case "$v" in [0-9]*.[0-9]*) printf '%s' "$v" ;; esac
+}
+
+arch_name() {
+  # Report arm64 even when this shell runs under Rosetta.
+  if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then echo arm64; else echo x64; fi
+}
+
+release_url() { # $1 = file name
+  local u="${DESK_BUDDY_RELEASE_URL//\{version\}/$PINNED}"
+  printf '%s' "${u//\{file\}/$1}"
+}
+
+# Install "Deskie.app" from a zip into $APPS_DIR. $1 = zip path.
+install_zip() {
+  local zip="$1" tmp="$2"
+  mkdir -p "$tmp/x"
+  if ! ditto -x -k "$zip" "$tmp/x"; then log "unzip failed: $zip"; return 1; fi
+  if [ ! -d "$tmp/x/$APP_NAME" ]; then log "zip has no $APP_NAME"; return 1; fi
+  xattr -dr com.apple.quarantine "$tmp/x/$APP_NAME" 2>/dev/null
+  mkdir -p "$APPS_DIR"
+  if [ -e "$APP" ]; then mv "$APP" "$tmp/old.app" || { log "cannot move old app aside"; return 1; }; fi
+  if ! mv "$tmp/x/$APP_NAME" "$APP"; then
+    log "install failed; restoring the old app"
+    [ -e "$tmp/old.app" ] && mv "$tmp/old.app" "$APP"
+    return 1
+  fi
+  if xattr -p com.apple.quarantine "$APP" >/dev/null 2>&1; then log "warning: quarantine attribute present on $APP"; fi
+  log "installed $(installed_version "$APP") into $APP"
+  return 0
+}
+
+download_and_install() {
+  local arch file tmp expected actual
+  arch="$(arch_name)"
+  file="Deskie-$PINNED-$arch.zip"
+  mkdir -p "$HOME_DIR"
+  tmp="$(mktemp -d "$HOME_DIR/download.XXXXXX")" || return 1
+  log "downloading $(release_url "$file")"
+  if ! curl -fsSL --retry 2 --connect-timeout 10 -m 900 -o "$tmp/$file" "$(release_url "$file")"; then
+    log "download failed"; rm -rf "$tmp"; return 1
+  fi
+  if ! curl -fsSL --retry 2 --connect-timeout 10 -m 60 -o "$tmp/SHA256SUMS" "$(release_url SHA256SUMS)"; then
+    log "SHA256SUMS download failed"; rm -rf "$tmp"; return 1
+  fi
+  expected="$(awk -v f="$file" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp/SHA256SUMS")"
+  actual="$(shasum -a 256 "$tmp/$file" | awk '{ print $1 }')"
+  if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    log "checksum mismatch for $file (expected '$expected', got '$actual')"; rm -rf "$tmp"; return 1
+  fi
+  install_zip "$tmp/$file" "$tmp"; local rc=$?
+  rm -rf "$tmp"
+  return $rc
+}
+
+launch_bundle() { # $1 = .app path
+  local args=(-g)
+  [ -n "${DESK_BUDDY_HOME:-}" ] && args+=(--env "DESK_BUDDY_HOME=$DESK_BUDDY_HOME")
+  [ -n "${DESK_BUDDY_PORT:-}" ] && args+=(--env "DESK_BUDDY_PORT=$DESK_BUDDY_PORT")
+  log "open ${args[*]} $1"
+  "${DESK_BUDDY_OPEN_CMD:-open}" "${args[@]}" "$1"
+}
+
+launch_source() { # $1 = source checkout with package.json
+  local electron="$1/node_modules/.bin/electron"
+  if [ ! -x "$electron" ]; then log "no Electron in $1 (run npm install)"; return 1; fi
+  log "starting source checkout $1"
+  (cd "$1" && nohup "$electron" . >/dev/null 2>&1 &)
+}
+
+work() {
+  lock="$HOME_DIR/launcher.lock"   # global, so the EXIT trap still sees it
+  mkdir -p "$HOME_DIR"
+  if ! mkdir "$lock" 2>/dev/null; then
+    # Another launcher is busy. Take over a lock older than 15 minutes.
+    if [ -n "$(find "$lock" -maxdepth 0 -mmin +15 2>/dev/null)" ]; then
+      rm -rf "$lock"; mkdir "$lock" 2>/dev/null || return 0
+    else
+      return 0
+    fi
+  fi
+  trap 'rm -rf "$lock"' EXIT
+
+  local dev="${DESK_BUDDY_DEV_APP:-}"
+  if [ -n "$dev" ]; then
+    case "$dev" in
+      *.app|*.app/) launch_bundle "$dev" ;;
+      *.zip)
+        local tmp; tmp="$(mktemp -d "$HOME_DIR/download.XXXXXX")" || return 0
+        install_zip "$dev" "$tmp"; rm -rf "$tmp"
+        launch_bundle "$APP" ;;
+      *) if [ -f "$dev/package.json" ]; then launch_source "$dev"; else log "DESK_BUDDY_DEV_APP not usable: $dev"; fi ;;
+    esac
+  else
+    local have; have="$(installed_version "$APP")"
+    if [ -z "$have" ] || version_lt "$have" "$PINNED"; then
+      download_and_install || { [ -n "$have" ] || return 0; }
+    fi
+    [ -d "$APP" ] && launch_bundle "$APP"
+  fi
+
+  local i=0 wait="${DESK_BUDDY_HEALTH_WAIT:-20}"
+  while :; do
+    healthy && { log "app is up"; return 0; }
+    [ "$i" -ge "$wait" ] && break
+    sleep 1; i=$((i + 1))
+  done
+  log "app did not answer /health within $wait s"
+}
+
+# The one time this hook prints: a first install or an update is about to download the app, so the user
+# is told why Tom isn't there yet. `systemMessage` JSON is shown in the transcript, never added to context.
+if [ -z "${DESK_BUDDY_DEV_APP:-}" ] && [ ! -d "$HOME_DIR/launcher.lock" ]; then
+  _have="$(installed_version "$APP")"
+  if [ -z "$_have" ]; then
+    printf '%s\n' '{"systemMessage":"Deskie: setting things up for the first time. Tom will appear in the top-right corner in about a minute."}' >&3
+  elif version_lt "$_have" "$PINNED"; then
+    printf '%s\n' '{"systemMessage":"Deskie: downloading an update in the background."}' >&3
+  fi
+fi
+
+exec 3>&-
+if [ "${DESK_BUDDY_LAUNCHER_FOREGROUND:-}" = "1" ]; then
+  work
+else
+  work &
+  disown 2>/dev/null
+fi
+exit 0

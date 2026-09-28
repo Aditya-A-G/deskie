@@ -1,0 +1,150 @@
+#!/bin/bash
+# Deskie hook: forward one Claude Code hook payload (stdin JSON) to the local app.
+#
+# Rules, because this runs inside every Claude Code session:
+#   - never write to stdout or stderr (stdout can become context or a decision)
+#   - always exit 0, and never wait on the app for more than about 2 seconds
+#   - do nothing at all when DESK_BUDDY_CLASSIFIER=1 (the app's own `claude -p` check)
+#
+# What is sent: the hook payload unchanged, plus two top-level keys:
+#   "v": 1
+#   "envelope": { ts, TERM_PROGRAM, ITERM_SESSION_ID, TERM_SESSION_ID, tty, cwdName, claudePath, pluginVersion }
+#
+# Opt-in debug log: create ~/.desk-buddy/debug/enabled (or set DESK_BUDDY_DEBUG=1) and every
+# payload is appended to ~/.desk-buddy/debug/events.jsonl with the HTTP status the app returned.
+
+[ "${DESK_BUDDY_CLASSIFIER:-}" = "1" ] && exit 0
+
+# envelope.ts: epoch ms with sub-ms precision, taken first so the app can drop
+# out-of-order events (async hooks run in parallel). perl ships with macOS and starts in
+# about 5 ms; python3 is only a Command Line Tools shim on a stock Mac, so it is not used.
+if [ "${1:-}" != "--deliver" ]; then
+  TS="$(/usr/bin/perl -MTime::HiRes=time -e 'printf "%.3f", time * 1000' 2>/dev/null)"
+  case "$TS" in ''|*[!0-9.]*) TS="$(date +%s)000" ;; esac
+fi
+
+exec >/dev/null 2>&1
+export LC_ALL=C
+umask 077
+
+# `claude -p` kills async hooks that are still running when it exits, which would drop the
+# final Stop event. So the hook itself only hands stdin to a copy of this script running in
+# its own session (setsid via the system perl), and exits at once. $PPID (the claude
+# process) is passed along for the tty lookup.
+if [ "${1:-}" != "--deliver" ]; then
+  input="$(cat)"   # read all of it first, so the writer never sees a closed pipe
+  if [ -x /usr/bin/perl ]; then
+    printf '%s' "$input" | /usr/bin/perl -e 'use POSIX (); my $p = fork; exit 0 if !defined $p || $p; POSIX::setsid(); exec @ARGV; exit 0' \
+      /bin/bash "$0" --deliver "$PPID" "$TS"
+  else
+    printf '%s' "$input" | /bin/bash "$0" --deliver "$PPID" "$TS" &
+  fi
+  exit 0
+fi
+CLAUDE_PID="${2:-}"
+TS="${3:-}"
+case "$TS" in ''|*[!0-9.]*) TS="$(date +%s)000" ;; esac
+
+HOME_DIR="${DESK_BUDDY_HOME:-$HOME/.desk-buddy}"
+PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+MAX_BYTES=60000          # the app refuses bodies over 64 KB
+DEBUG_MAX_BYTES=5000000  # rotate the debug log past about 5 MB
+
+body="$(cat)"
+body="${body//$'\n'/}"   # JSON never needs raw newlines outside strings
+body="${body//$'\r'/}"
+body="${body#"${body%%[![:space:]]*}"}"
+case "$body" in "{"*"}") ;; *) exit 0 ;; esac
+
+# Shrink an oversized payload (e.g. a big tool_response or a long final message) so the
+# app still gets the event. Long strings keep their head and tail; the tail matters for
+# last_assistant_message because the question check reads the end of it.
+if [ "${#body}" -gt "$MAX_BYTES" ]; then
+  small="$(printf '%s' "$body" | /usr/bin/perl -MJSON::PP -e '
+    local $/; my $in = <STDIN>;
+    my $j = JSON::PP->new->utf8->canonical;
+    my $d = eval { $j->decode($in) }; exit 0 unless ref $d eq "HASH";
+    our $lim;
+    sub cut { my $x = shift;
+      if (ref $x eq "HASH")  { $x->{$_} = cut($x->{$_}) for keys %$x; return $x }
+      if (ref $x eq "ARRAY") { return [ map { cut($_) } @$x ] }
+      if (defined $x && !ref $x && length($x) > $lim) { my $h = int($lim / 4); return substr($x, 0, $h) . "\x{2026}" . substr($x, -($lim - $h)) }
+      return $x }
+    for my $l (8000, 2000, 500) { $lim = $l; my $o = $j->encode(cut($d)); if (length($o) < '"$MAX_BYTES"') { print $o; exit 0 } }
+    for my $k (qw(tool_response tool_input)) { $d->{$k} = { desk_buddy_truncated => JSON::PP::true } if exists $d->{$k} }
+    my $o = $j->encode($d); if (length($o) < '"$MAX_BYTES"') { print $o; exit 0 }
+    my %m = map { exists $d->{$_} ? ($_ => $d->{$_}) : () } qw(hook_event_name session_id cwd tool_name tool_use_id agent_id notification_type error);
+    print $j->encode(\%m);
+  ')"
+  case "$small" in "{"*) body="$small" ;; *) exit 0 ;; esac
+fi
+
+jstr() { # JSON string literal, without control characters
+  local s="$1"
+  s="${s//[[:cntrl:]]/}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+# The terminal of the claude process: the first ancestor that has a tty.
+tty=""
+pid="$CLAUDE_PID"
+for _ in 1 2 3 4 5; do
+  case "$pid" in ''|*[!0-9]*|0|1) break ;; esac
+  # shellcheck disable=SC2046  # split "ttys003 1234" into two words
+  set -- $(ps -o tty= -o ppid= -p "$pid" 2>/dev/null)
+  if [ -n "${1:-}" ] && [ "$1" != "??" ] && [ "$1" != "-" ]; then tty="/dev/$1"; break; fi
+  pid="${2:-}"
+done
+
+plugin_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PLUGIN_DIR/.claude-plugin/plugin.json" 2>/dev/null | head -n 1)"
+
+envelope="\"v\":1,\"envelope\":{\"ts\":$TS,\"TERM_PROGRAM\":$(jstr "${TERM_PROGRAM:-}"),\"ITERM_SESSION_ID\":$(jstr "${ITERM_SESSION_ID:-}"),\"TERM_SESSION_ID\":$(jstr "${TERM_SESSION_ID:-}"),\"tty\":$(jstr "$tty"),\"cwdName\":$(jstr "$(basename "$PWD")"),\"claudePath\":$(jstr "$(command -v claude 2>/dev/null)"),\"pluginVersion\":$(jstr "$plugin_version")}"
+
+rest="${body#\{}"
+rest="${rest#"${rest%%[![:space:]]*}"}"
+if [ "$rest" = "}" ]; then out="{$envelope}"; else out="{$envelope,$rest"; fi
+
+read_app() {
+  port=""; token=""
+  [ -r "$HOME_DIR/port" ] && read -r port < "$HOME_DIR/port"
+  [ -r "$HOME_DIR/token" ] && read -r token < "$HOME_DIR/token"
+  case "$port" in ''|*[!0-9]*) port="" ;; esac
+}
+read_app
+
+debug=0
+if [ "${DESK_BUDDY_DEBUG:-}" = "1" ] || [ -e "$HOME_DIR/debug/enabled" ]; then debug=1; fi
+
+code=""
+deliver() {
+  code="no-app"
+  if [ -n "$port" ] && [ -n "$token" ]; then
+    code="$(printf '%s' "$out" | curl -s -m 2 -o /dev/null -w '%{http_code}' \
+      -H 'Content-Type: application/json' \
+      -H "X-Desk-Buddy-Token: $token" \
+      --data-binary @- "http://127.0.0.1:$port/event" 2>/dev/null)"
+    [ -n "$code" ] || code="000"
+  fi
+  if [ "$debug" = "1" ]; then
+    mkdir -p "$HOME_DIR/debug"
+    local log="$HOME_DIR/debug/events.jsonl"
+    if [ -f "$log" ] && [ "$(wc -c < "$log")" -gt "$DEBUG_MAX_BYTES" ]; then mv -f "$log" "$log.1"; fi
+    printf '{"at":%s,"status":"%s","event":%s}\n' "$(date +%s)" "$code" "$out" >> "$log"
+  fi
+}
+
+deliver
+# SessionStart runs alongside ensure-running, which may still be starting the app: this copy is
+# detached, so it can keep trying for a little while (about 20 s) without holding Claude up.
+case "$body" in *'"hook_event_name"'*'"SessionStart"'*)
+  tries=0
+  while { [ "$code" = "no-app" ] || [ "$code" = "000" ]; } && [ "$tries" -lt "${DESK_BUDDY_START_TRIES:-20}" ]; do
+    sleep 1
+    tries=$((tries + 1))
+    read_app
+    deliver
+  done ;;
+esac
+exit 0

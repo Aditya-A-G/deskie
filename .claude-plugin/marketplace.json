@@ -1,0 +1,14 @@
+{
+  "name": "deskie",
+  "description": "Deskie: a 3D character in the corner of your screen that reacts to Claude Code (macOS).",
+  "owner": {
+    "name": "Aditya Ghadge"
+  },
+  "plugins": [
+    {
+      "name": "deskie",
+      "source": "./plugin",
+      "description": "Sends Claude Code hook events to the Deskie corner app and starts the app with each session. macOS only."
+    }
+  ]
+}
