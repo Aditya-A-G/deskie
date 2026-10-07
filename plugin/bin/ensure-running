@@ -1,22 +1,32 @@
 #!/bin/bash
-# Deskie launcher, run by the SessionStart hook.
+# Deskie launcher, run by the SessionStart hook (and, with --on-prompt, by the async UserPromptSubmit hook).
 #
 # Fast path (a few ms): exit if the app answers /health, or if
 # ~/.desk-buddy/settings.json has "startWithClaude": false.
 # Otherwise a detached background job installs the app if needed and starts it with
 # `open -g` (no focus steal), so Claude never waits on a download.
 #
-# Never prints, always exits 0. Progress goes to ~/.desk-buddy/launcher.log.
+# Always exits 0. Progress goes to ~/.desk-buddy/launcher.log. It prints (a `systemMessage`, shown in the
+# transcript, never added to context) only: on a first install or update ("setting things up"), once when the
+# download failed (404, offline or a checksum mismatch, told at the next session start), and once ever on a Mac older than macOS 13.
 #
 # Overrides (for development and tests):
 #   DESK_BUDDY_DEV_APP=/path/Deskie.app   launch this bundle as is, no install
-#   DESK_BUDDY_DEV_APP=/path/to/desk-buddy/app  run the source checkout with its local Electron
+#   DESK_BUDDY_DEV_APP=/path/to/source/app       run the source checkout with its local Electron
 #   DESK_BUDDY_DEV_APP=/path/to/Desk-Buddy.zip  install from this zip (no checksum check)
 #   DESK_BUDDY_RELEASE_URL=http://127.0.0.1:8000/{file}   release URL template ({version}, {file})
 #   DESK_BUDDY_APPS_DIR=/some/dir              install here instead of ~/Applications
 #   DESK_BUDDY_HOME=/some/dir                  instead of ~/.desk-buddy (passed on to the app)
 #   DESK_BUDDY_LAUNCHER_FOREGROUND=1           do the work in the foreground (tests)
 #   DESK_BUDDY_OPEN_CMD, DESK_BUDDY_HEALTH_WAIT  replace `open` and the 20 s health wait (tests)
+#   DESK_BUDDY_PROMPT_EVERY=180                --on-prompt: seconds between two checks (tests)
+#
+# --on-prompt (UserPromptSubmit, async): brings back a quit or crashed Deskie on the next message. At most one check
+# every 3 minutes (the mtime of ~/.desk-buddy/prompt-check), and only when the app is already installed: it never
+# downloads or updates (SessionStart does that), so an Uninstall from the menu is never undone by a chat that still
+# has the plugin loaded. A Quit from Deskie's menu is respected too: it leaves ~/.desk-buddy/quit-by-user, and while
+# that exists the on-prompt check does nothing. A session start (no --on-prompt) clears it and starts Deskie, as the
+# quit dialog says; so only a crash or another unexpected exit comes back on the next message. Prints nothing.
 
 [ "${DESK_BUDDY_CLASSIFIER:-}" = "1" ] && exit 0
 
@@ -46,6 +56,24 @@ healthy() {
   curl -s -m 1 "http://127.0.0.1:$port/health" 2>/dev/null | grep -q '"ok":true'
 }
 
+ON_PROMPT=0
+if [ "${1:-}" = "--on-prompt" ]; then
+  ON_PROMPT=1
+  [ -d "$APP" ] || [ -n "${DESK_BUDDY_DEV_APP:-}" ] || exit 0
+  [ -e "$HOME_DIR/quit-by-user" ] && exit 0
+  _stamp="$HOME_DIR/prompt-check"
+  _every="${DESK_BUDDY_PROMPT_EVERY:-180}"
+  case "$_every" in ''|*[!0-9]*) _every=180 ;; esac
+  if [ -f "$_stamp" ]; then
+    _age=$(( $(date +%s) - $(stat -f %m "$_stamp" 2>/dev/null || echo 0) ))
+    [ "$_age" -ge 0 ] && [ "$_age" -lt "$_every" ] && exit 0
+  fi
+  mkdir -p "$HOME_DIR" && : > "$_stamp"
+  exec 3>/dev/null   # never a systemMessage from a prompt
+else
+  rm -f "$HOME_DIR/quit-by-user"   # a session start: Deskie starts again, as the quit dialog says
+fi
+
 healthy && exit 0
 
 log() {
@@ -70,6 +98,24 @@ version_lt() {
   done
   return 1
 }
+
+# Deskie needs macOS 13 Ventura or later (Electron's LSMinimumSystemVersion). On an older Mac, download nothing,
+# log why and tell the user ONCE (a marker in the Deskie home folder), not in every session. An unreadable version
+# is not treated as too old.
+if [ -z "${DESK_BUDDY_DEV_APP:-}" ]; then
+  MACOS_VERSION="$(sw_vers -productVersion 2>/dev/null)"
+  case "$MACOS_VERSION" in
+    [0-9]*)
+      if version_lt "$MACOS_VERSION" "13.0"; then
+        log "skipped: Deskie needs macOS 13 Ventura or later (this Mac has macOS $MACOS_VERSION)"
+        if [ ! -e "$HOME_DIR/told-macos-too-old" ]; then
+          printf '%s\n' "{\"systemMessage\":\"Deskie needs macOS 13 Ventura or later. This Mac has macOS ${MACOS_VERSION//[^0-9.]/}, so Deskie was not installed.\"}" >&3
+          : > "$HOME_DIR/told-macos-too-old"
+        fi
+        exit 0
+      fi ;;
+  esac
+fi
 
 installed_version() { # prints nothing when there is no app (PlistBuddy reports errors on stdout)
   [ -f "$1/Contents/Info.plist" ] || return 0
@@ -107,42 +153,63 @@ install_zip() {
   return 0
 }
 
+# A failed download leaves "<notfound|offline|checksum> <version>" in $FAIL_MARK; the next session start tells the
+# user once (see the end of this file). A good install clears it.
+FAIL_MARK="$HOME_DIR/download-failed"
+TOLD_MARK="$HOME_DIR/download-failed-told"
+download_failed() { # $1 = curl's exit code. 22: the server answered an HTTP error (404: no such release); else offline.
+  local kind=offline                 # ("checksum": the download didn't match SHA256SUMS)
+  [ "$1" = "22" ] && kind=notfound
+  [ "$1" = "checksum" ] && kind=checksum
+  printf '%s %s\n' "$kind" "$PINNED" > "$FAIL_MARK"
+}
+
 download_and_install() {
-  local arch file tmp expected actual
+  local arch file tmp expected actual rc
   arch="$(arch_name)"
   file="Deskie-$PINNED-$arch.zip"
   mkdir -p "$HOME_DIR"
   tmp="$(mktemp -d "$HOME_DIR/download.XXXXXX")" || return 1
   log "downloading $(release_url "$file")"
-  if ! curl -fsSL --retry 2 --connect-timeout 10 -m 900 -o "$tmp/$file" "$(release_url "$file")"; then
-    log "download failed"; rm -rf "$tmp"; return 1
+  curl -fsSL --retry 2 --connect-timeout 10 -m 900 -o "$tmp/$file" "$(release_url "$file")"; rc=$?
+  if [ "$rc" != 0 ]; then
+    log "download failed (curl $rc)"; download_failed "$rc"; rm -rf "$tmp"; return 1
   fi
-  if ! curl -fsSL --retry 2 --connect-timeout 10 -m 60 -o "$tmp/SHA256SUMS" "$(release_url SHA256SUMS)"; then
-    log "SHA256SUMS download failed"; rm -rf "$tmp"; return 1
+  curl -fsSL --retry 2 --connect-timeout 10 -m 60 -o "$tmp/SHA256SUMS" "$(release_url SHA256SUMS)"; rc=$?
+  if [ "$rc" != 0 ]; then
+    log "SHA256SUMS download failed (curl $rc)"; download_failed "$rc"; rm -rf "$tmp"; return 1
   fi
   expected="$(awk -v f="$file" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp/SHA256SUMS")"
   actual="$(shasum -a 256 "$tmp/$file" | awk '{ print $1 }')"
   if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
-    log "checksum mismatch for $file (expected '$expected', got '$actual')"; rm -rf "$tmp"; return 1
+    log "checksum mismatch for $file (expected '$expected', got '$actual')"; download_failed checksum; rm -rf "$tmp"; return 1
   fi
-  install_zip "$tmp/$file" "$tmp"; local rc=$?
+  install_zip "$tmp/$file" "$tmp"; rc=$?
   rm -rf "$tmp"
+  [ "$rc" = 0 ] && rm -f "$FAIL_MARK" "$TOLD_MARK"
   return $rc
 }
+
+# The app must not open Settings when this launcher `open`s it while it is already running (macOS then sends it a
+# reopen event, which is what a user's own launch looks like). So the launcher leaves a fresh marker file first,
+# and passes --from-launcher to a new instance.
+mark_launch() { mkdir -p "$HOME_DIR"; : > "$HOME_DIR/launcher-open"; }
 
 launch_bundle() { # $1 = .app path
   local args=(-g)
   [ -n "${DESK_BUDDY_HOME:-}" ] && args+=(--env "DESK_BUDDY_HOME=$DESK_BUDDY_HOME")
   [ -n "${DESK_BUDDY_PORT:-}" ] && args+=(--env "DESK_BUDDY_PORT=$DESK_BUDDY_PORT")
   log "open ${args[*]} $1"
-  "${DESK_BUDDY_OPEN_CMD:-open}" "${args[@]}" "$1"
+  mark_launch
+  "${DESK_BUDDY_OPEN_CMD:-open}" "${args[@]}" "$1" --args --from-launcher
 }
 
 launch_source() { # $1 = source checkout with package.json
   local electron="$1/node_modules/.bin/electron"
   if [ ! -x "$electron" ]; then log "no Electron in $1 (run npm install)"; return 1; fi
   log "starting source checkout $1"
-  (cd "$1" && nohup "$electron" . >/dev/null 2>&1 &)
+  mark_launch
+  (cd "$1" && nohup "$electron" . --from-launcher >/dev/null 2>&1 &)
 }
 
 work() {
@@ -170,7 +237,7 @@ work() {
     esac
   else
     local have; have="$(installed_version "$APP")"
-    if [ -z "$have" ] || version_lt "$have" "$PINNED"; then
+    if [ "$ON_PROMPT" != 1 ] && { [ -z "$have" ] || version_lt "$have" "$PINNED"; }; then
       download_and_install || { [ -n "$have" ] || return 0; }
     fi
     [ -d "$APP" ] && launch_bundle "$APP"
@@ -185,14 +252,32 @@ work() {
   log "app did not answer /health within $wait s"
 }
 
-# The one time this hook prints: a first install or an update is about to download the app, so the user
-# is told why Tom isn't there yet. `systemMessage` JSON is shown in the transcript, never added to context.
-if [ -z "${DESK_BUDDY_DEV_APP:-}" ] && [ ! -d "$HOME_DIR/launcher.lock" ]; then
+# When this hook prints: a first install or an update is about to download the app, so the user is told why Tom
+# isn't there yet. If the last download of this version failed, the user is told that instead, ONCE (with what to
+# do), and after that nothing while it keeps retrying quietly. `systemMessage` JSON is shown in the transcript,
+# never added to context.
+if [ "$ON_PROMPT" != 1 ] && [ -z "${DESK_BUDDY_DEV_APP:-}" ] && [ ! -d "$HOME_DIR/launcher.lock" ]; then
   _have="$(installed_version "$APP")"
-  if [ -z "$_have" ]; then
-    printf '%s\n' '{"systemMessage":"Deskie: setting things up for the first time. Tom will appear in the top-right corner in about a minute."}' >&3
-  elif version_lt "$_have" "$PINNED"; then
-    printf '%s\n' '{"systemMessage":"Deskie: downloading an update in the background."}' >&3
+  if [ -z "$_have" ] || version_lt "$_have" "$PINNED"; then
+    _kind=""; _ver=""
+    [ -r "$FAIL_MARK" ] && read -r _kind _ver < "$FAIL_MARK"
+    [ "$_ver" = "$PINNED" ] || _kind="" # a marker from another version: stale
+    if [ -n "$_kind" ]; then
+      if [ "$(cat "$TOLD_MARK" 2>/dev/null)" != "$_kind $_ver" ]; then
+        if [ "$_kind" = checksum ]; then
+          printf '%s\n' '{"systemMessage":"Deskie: the downloaded app did not match its checksum, so it was not installed. It will try again when you start your next Claude session. If this keeps happening, see launcher.log in the ~/.desk-buddy folder."}' >&3
+        elif [ "$_kind" = notfound ]; then
+          printf '%s\n' "{\"systemMessage\":\"Deskie: the app download (version ${PINNED//[^0-9A-Za-z.-]/}) is not available on GitHub yet. Run /plugin marketplace update deskie, then start a new Claude session. Deskie keeps trying in the background.\"}" >&3
+        else
+          printf '%s\n' '{"systemMessage":"Deskie: could not download the app (no internet connection?). It will try again when you start your next Claude session."}' >&3
+        fi
+        printf '%s %s\n' "$_kind" "$_ver" > "$TOLD_MARK"
+      fi
+    elif [ -z "$_have" ]; then
+      printf '%s\n' '{"systemMessage":"Deskie: setting things up for the first time. Tom will appear in the top-right corner in about a minute."}' >&3
+    else
+      printf '%s\n' '{"systemMessage":"Deskie: downloading an update in the background."}' >&3
+    fi
   fi
 fi
 
@@ -200,7 +285,9 @@ exec 3>&-
 if [ "${DESK_BUDDY_LAUNCHER_FOREGROUND:-}" = "1" ]; then
   work
 else
-  work &
+  # A subshell, so its EXIT trap runs when the work ends and the lock is released (bash 3.2 skips the
+  # EXIT trap of a plain `work &` background function).
+  ( work ) &
   disown 2>/dev/null
 fi
 exit 0

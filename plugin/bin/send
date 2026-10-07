@@ -8,7 +8,9 @@
 #
 # What is sent: the hook payload unchanged, plus two top-level keys:
 #   "v": 1
-#   "envelope": { ts, TERM_PROGRAM, ITERM_SESSION_ID, TERM_SESSION_ID, tty, cwdName, claudePath, pluginVersion }
+#   "envelope": { ts, TERM_PROGRAM, ITERM_SESSION_ID, TERM_SESSION_ID, tty, cwdName, claudePath, pluginVersion,
+#                 claudePid (the claude process, or null), headless (true for `claude -p` / `--print`),
+#                 claudeConfigDir (CLAUDE_CONFIG_DIR, or "": the app also watches that folder's open chats) }
 #
 # Opt-in debug log: create ~/.desk-buddy/debug/enabled (or set DESK_BUDDY_DEBUG=1) and every
 # payload is appended to ~/.desk-buddy/debug/events.jsonl with the HTTP status the app returned.
@@ -92,15 +94,45 @@ tty=""
 pid="$CLAUDE_PID"
 for _ in 1 2 3 4 5; do
   case "$pid" in ''|*[!0-9]*|0|1) break ;; esac
-  # shellcheck disable=SC2046  # split "ttys003 1234" into two words
-  set -- $(ps -o tty= -o ppid= -p "$pid" 2>/dev/null)
+  # shellcheck disable=SC2046  # split "ttys003 1234" into two words (no globbing: "??" would match file names)
+  set -f; set -- $(ps -o tty= -o ppid= -p "$pid" 2>/dev/null); set +f
   if [ -n "${1:-}" ] && [ "$1" != "??" ] && [ "$1" != "-" ]; then tty="/dev/$1"; break; fi
   pid="${2:-}"
 done
 
+# The claude process itself (envelope.claudePid): the first ancestor whose program is claude (the native binary, or
+# node running the claude-code package). The hook's parent may be a shell in between. The app watches this pid for
+# approved Bash commands (a new child sourcing a shell snapshot) and for the chat's end.
+is_claude_args() { # $1 = the full args of a process
+  local w1 w2
+  # shellcheck disable=SC2086  # split into words on purpose (no globbing)
+  set -f; set -- $1; set +f
+  w1="${1##*/}"; w2="${2:-}"; w2="${w2##*/}"
+  case "$w1" in claude|claude.exe) return 0 ;; esac
+  case "$w1" in node|bun|bash|sh|zsh)
+    case "${2:-}" in */claude|*/claude-code/cli.js|*/claude-code/cli.mjs) return 0 ;; esac
+    [ "$w2" = "claude" ] && return 0 ;;
+  esac
+  return 1
+}
+claude_pid=""
+claude_args=""
+pid="$CLAUDE_PID"
+for _ in 1 2 3 4 5 6; do
+  case "$pid" in ''|*[!0-9]*|0|1) break ;; esac
+  a="$(ps -o args= -p "$pid" 2>/dev/null)"
+  [ -n "$a" ] || break
+  if is_claude_args "$a"; then claude_pid="$pid"; claude_args="$a"; break; fi
+  pid="$(ps -o ppid= -p "$pid" 2>/dev/null)"; pid="${pid//[[:space:]]/}"
+done
+# `claude -p` / `--print`: a headless run (scripts, CI, the app's own checks). The app ignores those sessions.
+headless=false
+case " $claude_args " in *" -p "*|*" --print "*|*" --print="*) headless=true ;; esac
+claude_pid_json="${claude_pid:-null}"
+
 plugin_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PLUGIN_DIR/.claude-plugin/plugin.json" 2>/dev/null | head -n 1)"
 
-envelope="\"v\":1,\"envelope\":{\"ts\":$TS,\"TERM_PROGRAM\":$(jstr "${TERM_PROGRAM:-}"),\"ITERM_SESSION_ID\":$(jstr "${ITERM_SESSION_ID:-}"),\"TERM_SESSION_ID\":$(jstr "${TERM_SESSION_ID:-}"),\"tty\":$(jstr "$tty"),\"cwdName\":$(jstr "$(basename "$PWD")"),\"claudePath\":$(jstr "$(command -v claude 2>/dev/null)"),\"pluginVersion\":$(jstr "$plugin_version")}"
+envelope="\"v\":1,\"envelope\":{\"ts\":$TS,\"TERM_PROGRAM\":$(jstr "${TERM_PROGRAM:-}"),\"ITERM_SESSION_ID\":$(jstr "${ITERM_SESSION_ID:-}"),\"TERM_SESSION_ID\":$(jstr "${TERM_SESSION_ID:-}"),\"tty\":$(jstr "$tty"),\"cwdName\":$(jstr "$(basename "$PWD")"),\"claudePath\":$(jstr "$(command -v claude 2>/dev/null)"),\"pluginVersion\":$(jstr "$plugin_version"),\"claudePid\":$claude_pid_json,\"headless\":$headless,\"claudeConfigDir\":$(jstr "${CLAUDE_CONFIG_DIR:-}")}"
 
 rest="${body#\{}"
 rest="${rest#"${rest%%[![:space:]]*}"}"

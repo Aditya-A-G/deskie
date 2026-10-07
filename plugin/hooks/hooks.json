@@ -27,6 +27,12 @@
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/send",
             "args": [],
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/ensure-running",
+            "args": ["--on-prompt"],
+            "async": true
           }
         ]
       }
