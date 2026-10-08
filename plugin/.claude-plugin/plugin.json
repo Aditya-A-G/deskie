@@ -1,6 +1,6 @@
 {
   "name": "deskie",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "A 3D desk buddy in the corner of your screen that types while Claude works, waves when Claude needs you and cheers when it is done. macOS only.",
   "author": {
     "name": "Aditya Ghadge"

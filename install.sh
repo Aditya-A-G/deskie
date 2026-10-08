@@ -10,7 +10,7 @@
 # app again right after this. Newer releases come through Deskie's own updater.
 #
 # Overrides (development and tests):
-#   DESK_BUDDY_APP_VERSION=0.1.2                    install this version
+#   DESK_BUDDY_APP_VERSION=0.1.3                    install this version
 #   DESK_BUDDY_RELEASE_URL=http://host/{file}       release URL template ({version}, {file})
 #   DESK_BUDDY_APPS_DIR=/some/dir                   install here instead of ~/Applications
 #   DESK_BUDDY_HOME=/some/dir                       Deskie's data folder instead of ~/.desk-buddy (passed to the app)
@@ -21,7 +21,7 @@
 #
 # Written for POSIX sh (macOS /bin/sh), and wrapped in main() so a cut-off download runs nothing.
 
-PINNED_VERSION="0.1.2"
+PINNED_VERSION="0.1.3"
 DEFAULT_RELEASE_URL='https://github.com/Aditya-A-G/deskie/releases/download/v{version}/{file}'
 
 main() {

@@ -71,7 +71,7 @@ if [ "${1:-}" = "--on-prompt" ]; then
   mkdir -p "$HOME_DIR" && : > "$_stamp"
   exec 3>/dev/null   # never a systemMessage from a prompt
 else
-  rm -f "$HOME_DIR/quit-by-user"   # a session start: Deskie starts again, as the quit dialog says
+  rm -f "$HOME_DIR/quit-by-user"   # a session start: Deskie starts again (README "Always there", Tips)
 fi
 
 healthy && exit 0
