@@ -109,8 +109,10 @@ is_claude_args() { # $1 = the full args of a process
   set -f; set -- $1; set +f
   w1="${1##*/}"; w2="${2:-}"; w2="${w2##*/}"
   case "$w1" in claude|claude.exe) return 0 ;; esac
+  # the native install's real binary, as Claude Code's background host starts it: ~/.local/share/claude/versions/2.1.308
+  case "${1:-}" in */claude/versions/[0-9]*) return 0 ;; esac
   case "$w1" in node|bun|bash|sh|zsh)
-    case "${2:-}" in */claude|*/claude-code/cli.js|*/claude-code/cli.mjs) return 0 ;; esac
+    case "${2:-}" in */claude|*/claude-code/cli.js|*/claude-code/cli.mjs|*/claude/versions/[0-9]*) return 0 ;; esac
     [ "$w2" = "claude" ] && return 0 ;;
   esac
   return 1
